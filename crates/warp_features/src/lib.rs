@@ -969,6 +969,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::GPTConfigurableContextWindow,
     FeatureFlag::RestorePromptOnInlineModelSelectorSearch,
     FeatureFlag::WarpControlCli,
+    FeatureFlag::TerminalLifecycleRecovery,
     FeatureFlag::PromptCacheExpiryWarning,
     FeatureFlag::PinnedTabs,
     FeatureFlag::ContextWindowUsageBreakdown,
