@@ -209,15 +209,26 @@ impl CLIAgentSession {
             .clone()
             .or(self.session_context.session_id.take());
 
+        // A SessionStart marks a fresh agent session in this terminal. Drop
+        // conversation state inherited from whatever ran here before — the new
+        // session's transcript path arrives with its first Stop event, and its
+        // title must not bleed in from a previous session in this tab.
+        if matches!(event.event, CLIAgentEventType::SessionStart) {
+            self.session_context.transcript_path = None;
+            self.session_context.ai_title = None;
+            self.session_context.query = None;
+            self.session_context.response = None;
+        }
+
         if event.payload.transcript_path.is_some() {
             self.session_context.transcript_path = event.payload.transcript_path.clone();
         }
 
         // Refresh Claude Code's own session title from the transcript on every
         // event. The authoritative path only arrives with Stop events, so it is
-        // cached above and reused; before the first Stop, fall back to locating
-        // the transcript on disk. Renames (`/rename`) emit no event of their
-        // own, so reading on tool events too picks them up mid-turn.
+        // cached above and reused; before the first Stop, probe the session's
+        // conventional transcript location. Renames (`/rename`) emit no event
+        // of their own, so reading on tool events too picks them up mid-turn.
         let transcript = self.session_context.transcript_path.clone().or_else(|| {
             locate_transcript(
                 self.session_context.session_id.as_deref(),
@@ -347,47 +358,27 @@ fn read_latest_session_title(path: &str) -> Option<String> {
 }
 
 /// Locates the Claude Code transcript for a session when no event has carried a
-/// `transcript_path` yet. Transcripts live at
-/// `<home>/.claude/projects/<escaped-cwd>/<sessionId>.jsonl`, where the cwd is
-/// escaped by replacing every non-alphanumeric char with `-`. The session id
-/// reported by the plugin doesn't always name a transcript file (team sessions
-/// report a team-lead id with no `.jsonl` of its own), so when the direct path
-/// is missing this falls back to the most recently modified transcript in the
-/// project directory — while a session is emitting events, that is the file
-/// Claude Code is appending to. A wrong pick from a concurrent session in the
-/// same cwd self-corrects at the first Stop event, which carries the real path.
+/// `transcript_path` yet, by probing the conventional location
+/// `<home>/.claude/projects/<escaped-cwd>/<sessionId>.jsonl` (cwd escaped by
+/// replacing every non-alphanumeric char with `-`). The session id reported by
+/// the plugin doesn't always name a transcript file (team sessions report a
+/// team-lead id with no `.jsonl` of its own), so this can legitimately come up
+/// empty; the title then waits for a Stop event to supply the authoritative
+/// path. Deliberately NOT a newest-file-in-directory guess: sessions sharing a
+/// cwd share the project directory, and adopting another session's transcript
+/// makes every new tab inherit that session's title.
 fn locate_transcript(session_id: Option<&str>, cwd: Option<&str>) -> Option<String> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     let escaped: String = cwd?
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let mut dir = std::path::PathBuf::from(home);
-    dir.push(".claude");
-    dir.push("projects");
-    dir.push(escaped);
-
-    if let Some(id) = session_id {
-        let direct = dir.join(format!("{id}.jsonl"));
-        if direct.is_file() {
-            return Some(direct.to_string_lossy().into_owned());
-        }
-    }
-
-    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "jsonl") {
-            continue;
-        }
-        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
-            continue;
-        };
-        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
-            newest = Some((modified, path));
-        }
-    }
-    newest.map(|(_, path)| path.to_string_lossy().into_owned())
+    let mut path = std::path::PathBuf::from(home);
+    path.push(".claude");
+    path.push("projects");
+    path.push(escaped);
+    path.push(format!("{}.jsonl", session_id?));
+    path.is_file().then(|| path.to_string_lossy().into_owned())
 }
 
 /// Events emitted by `CLIAgentSessionsModel` for subscribers (e.g., `AgentNotificationsModel`).
