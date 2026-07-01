@@ -44,6 +44,15 @@ pub struct CLIAgentSessionContext {
     pub summary: Option<String>,
     pub query: Option<String>,
     pub response: Option<String>,
+    /// Claude Code's own generated session title (its `ai-title`), read from the
+    /// session transcript. Preferred as the tab title so agent tabs show the
+    /// session's real name rather than the latest prompt or launch command.
+    pub ai_title: Option<String>,
+    /// Authoritative transcript path, cached from the plugin events that carry
+    /// one (Claude Code's Stop hook). Most events omit it, and the reported
+    /// `session_id` doesn't always name a transcript file (team sessions report
+    /// a team-lead id), so the last known path is reused for title reads.
+    pub transcript_path: Option<String>,
 }
 
 /// State of the rich input editor for composing a prompt to send to a CLI agent.
@@ -91,7 +100,21 @@ pub enum CLIAgentInputEntrypoint {
 
 impl CLIAgentSessionContext {
     pub(crate) fn display_title(&self) -> Option<String> {
-        self.latest_user_prompt().or_else(|| self.title_like_text())
+        // Prefer Claude Code's own session title; fall back to the latest prompt
+        // and then a summary so a title still shows before the agent generates one.
+        self.ai_session_title()
+            .or_else(|| self.latest_user_prompt())
+            .or_else(|| self.title_like_text())
+    }
+
+    /// Claude Code's generated session title, if one has been read from the
+    /// transcript and is non-empty.
+    pub(crate) fn ai_session_title(&self) -> Option<String> {
+        self.ai_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned)
     }
 
     pub(crate) fn latest_user_prompt(&self) -> Option<String> {
@@ -186,6 +209,25 @@ impl CLIAgentSession {
             .clone()
             .or(self.session_context.session_id.take());
 
+        if event.payload.transcript_path.is_some() {
+            self.session_context.transcript_path = event.payload.transcript_path.clone();
+        }
+
+        // Refresh Claude Code's own session title from the transcript on every
+        // event. The authoritative path only arrives with Stop events, so it is
+        // cached above and reused; before the first Stop, fall back to locating
+        // the transcript on disk. Renames (`/rename`) emit no event of their
+        // own, so reading on tool events too picks them up mid-turn.
+        let transcript = self.session_context.transcript_path.clone().or_else(|| {
+            locate_transcript(
+                self.session_context.session_id.as_deref(),
+                self.session_context.cwd.as_deref(),
+            )
+        });
+        if let Some(title) = transcript.as_deref().and_then(read_latest_session_title) {
+            self.session_context.ai_title = Some(title);
+        }
+
         let new_status = match &event.event {
             CLIAgentEventType::PromptSubmit => {
                 self.session_context.query = event.payload.query.clone();
@@ -241,6 +283,111 @@ impl CLIAgentSession {
         self.status = new_status.clone();
         Some(new_status)
     }
+}
+
+/// Reads Claude Code's session title from a transcript JSONL file. Prefers the
+/// user's `/rename` value (a `custom-title` entry's `customTitle`) and falls
+/// back to the auto-generated `ai-title`, matching Claude Code's own precedence.
+/// Only the tail of the file is scanned so large transcripts stay cheap.
+/// Returns `None` if the file can't be read or no title entry is present.
+fn read_latest_session_title(path: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Titles are appended as the session evolves, so the newest lives near the
+    // end. Reading a bounded tail keeps this cheap on large transcripts.
+    const TAIL_BYTES: u64 = 256 * 1024;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES))).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+
+    #[derive(serde::Deserialize)]
+    struct TitleEntry {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        #[serde(rename = "customTitle")]
+        custom_title: Option<String>,
+        #[serde(rename = "aiTitle")]
+        ai_title: Option<String>,
+    }
+
+    // Scan newest-first. A `custom-title` (the user's /rename) always wins over
+    // the auto `ai-title`. Partial first line from the tail cut just won't parse.
+    let mut ai_fallback: Option<String> = None;
+    for line in text.lines().rev() {
+        if !line.contains("-title\"") {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<TitleEntry>(line) else {
+            continue;
+        };
+        match entry.kind.as_deref() {
+            Some("custom-title") => {
+                if let Some(title) = entry
+                    .custom_title
+                    .map(|t| t.trim().to_owned())
+                    .filter(|t| !t.is_empty())
+                {
+                    return Some(title);
+                }
+            }
+            Some("ai-title") if ai_fallback.is_none() => {
+                ai_fallback = entry
+                    .ai_title
+                    .map(|t| t.trim().to_owned())
+                    .filter(|t| !t.is_empty());
+            }
+            _ => {}
+        }
+    }
+    ai_fallback
+}
+
+/// Locates the Claude Code transcript for a session when no event has carried a
+/// `transcript_path` yet. Transcripts live at
+/// `<home>/.claude/projects/<escaped-cwd>/<sessionId>.jsonl`, where the cwd is
+/// escaped by replacing every non-alphanumeric char with `-`. The session id
+/// reported by the plugin doesn't always name a transcript file (team sessions
+/// report a team-lead id with no `.jsonl` of its own), so when the direct path
+/// is missing this falls back to the most recently modified transcript in the
+/// project directory — while a session is emitting events, that is the file
+/// Claude Code is appending to. A wrong pick from a concurrent session in the
+/// same cwd self-corrects at the first Stop event, which carries the real path.
+fn locate_transcript(session_id: Option<&str>, cwd: Option<&str>) -> Option<String> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let escaped: String = cwd?
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let mut dir = std::path::PathBuf::from(home);
+    dir.push(".claude");
+    dir.push("projects");
+    dir.push(escaped);
+
+    if let Some(id) = session_id {
+        let direct = dir.join(format!("{id}.jsonl"));
+        if direct.is_file() {
+            return Some(direct.to_string_lossy().into_owned());
+        }
+    }
+
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "jsonl") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
+            newest = Some((modified, path));
+        }
+    }
+    newest.map(|(_, path)| path.to_string_lossy().into_owned())
 }
 
 /// Events emitted by `CLIAgentSessionsModel` for subscribers (e.g., `AgentNotificationsModel`).

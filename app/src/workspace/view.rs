@@ -3797,6 +3797,14 @@ impl Workspace {
                 self.sync_panel_positions_from_config(ctx);
                 ctx.notify();
             }
+            // Tab Coloring mode / status colors: tabs resolve their color from
+            // these settings on each render, so a redraw is all that's needed.
+            TabSettingsChangedEvent::TabColoringMode { .. }
+            | TabSettingsChangedEvent::StatusColorWorking { .. }
+            | TabSettingsChangedEvent::StatusColorBlocked { .. }
+            | TabSettingsChangedEvent::StatusColorIdle { .. } => {
+                ctx.notify();
+            }
         }
     }
 

@@ -5083,6 +5083,38 @@ impl PaneGroup {
         self.custom_title(ctx).unwrap_or_else(|| self.title(ctx))
     }
 
+    /// The live title of the focused pane's CLI-agent session (e.g. a Claude
+    /// session). Returns `None` when the focused pane isn't a recognized
+    /// CLI-agent session, so regular shells keep their normal
+    /// (terminal-derived) title. This lets agent tabs show the session's own
+    /// name instead of the frozen launch command.
+    ///
+    /// Sources, in order: the session title read from the agent's transcript
+    /// (a `/rename` wins over the auto title), then the terminal (OSC) title —
+    /// Claude Code maintains it as the live session name, including after
+    /// `/rename`, which emits no plugin event and on recent versions is the
+    /// only channel that carries the name — then prompt-derived fallbacks.
+    pub fn agent_session_title(&self, ctx: &AppContext) -> Option<String> {
+        let view = self.focused_session_view(ctx)?;
+        let session = crate::terminal::cli_agent_sessions::CLIAgentSessionsModel::as_ref(ctx)
+            .session(view.id())?;
+        if matches!(session.agent, crate::terminal::CLIAgent::Unknown) {
+            return None;
+        }
+        session
+            .session_context
+            .ai_session_title()
+            .or_else(|| {
+                let model = view.as_ref(ctx).model.lock();
+                model
+                    .terminal_title()
+                    .map(|title| title.trim().to_owned())
+                    .filter(|title| !title.is_empty())
+            })
+            .or_else(|| session.session_context.latest_user_prompt())
+            .or_else(|| session.session_context.title_like_text())
+    }
+
     /// The tab-level custom title, if one has been set via the rename-tab flow.
     pub fn custom_title(&self, _ctx: &AppContext) -> Option<String> {
         self.custom_title.clone()

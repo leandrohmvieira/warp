@@ -79,6 +79,7 @@ use crate::terminal::{
 use crate::themes::theme::{self, RespectSystemTheme, SelectedSystemThemes, ThemeKind, WarpTheme};
 use crate::themes::theme_chooser::ThemeChooserMode;
 use crate::ui_components::color_dot::{render_color_dot, TAB_COLOR_OPTIONS};
+use warp_core::ui::theme::AnsiColorIdentifier;
 use crate::ui_components::icons::Icon;
 use crate::user_config::WarpConfig;
 use crate::util::bindings;
@@ -92,7 +93,7 @@ use crate::workspace::header_toolbar_editor::HeaderToolbarInlineEditor;
 use crate::workspace::tab_settings::{
     canonical_directory_key, DirectoryTabColor, HideTitleBarSearchBarInVerticalTabs,
     PreserveActiveTabColor, ShowCodeReviewButton, ShowIndicatorsButton,
-    ShowVerticalTabPanelInRestoredWindows, TabCloseButtonPosition, TabSettings,
+    ShowVerticalTabPanelInRestoredWindows, TabCloseButtonPosition, TabColoringMode, TabSettings,
     TabSettingsChangedEvent, UseLatestUserPromptAsConversationTitleInTabNames, UseVerticalTabs,
     WorkspaceDecorationVisibility,
 };
@@ -479,6 +480,15 @@ impl FontType {
     }
 }
 
+/// Which CLI-agent status color a Tab Coloring color-picker row edits, for
+/// [`AppearancePageAction::SetTabStatusColor`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusColorTarget {
+    Working,
+    Blocked,
+    Idle,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppearancePageAction {
     LineHeightEditorResetRatio,
@@ -541,6 +551,13 @@ pub enum AppearancePageAction {
     RemoveDefaultDirectoryTabColor {
         path: PathBuf,
     },
+    /// Switch how tabs are colored (directory vs. terminal status).
+    SetTabColoringMode(TabColoringMode),
+    /// Assign a color to one of the CLI-agent status slots (working/blocked/idle).
+    SetTabStatusColor {
+        target: StatusColorTarget,
+        color: AnsiColorIdentifier,
+    },
 }
 
 pub struct AppearanceSettingsPageView {
@@ -567,12 +584,17 @@ pub struct AppearanceSettingsPageView {
     app_icon_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     workspace_decorations_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     tab_close_button_position_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
+    tab_coloring_mode_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     zoom_level_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     zoom_reset_button_mouse_state: MouseStateHandle,
     available_families: HashMap<String, (Option<FamilyId>, FontType)>,
     view_font_type: FontType,
     alt_screen_padding_editor: ViewHandle<EditorView>,
     color_picker_dot_states: Vec<Vec<MouseStateHandle>>,
+    /// Mouse states for the Tab Coloring status color-picker dots, one inner
+    /// vec per status row (working/blocked/idle), each with one entry per
+    /// [`TAB_COLOR_OPTIONS`] color.
+    status_color_dot_states: Vec<Vec<MouseStateHandle>>,
     directory_tab_color_delete_buttons: Vec<ViewHandle<ActionButton>>,
     header_toolbar_inline_editor: ViewHandle<HeaderToolbarInlineEditor>,
 
@@ -754,6 +776,28 @@ impl TypedActionView for AppearanceSettingsPageView {
                         .value()
                         .with_color(&path, DirectoryTabColor::Suppressed);
                     let _ = settings.directory_tab_colors.set_value(new_value, ctx);
+                });
+                ctx.notify();
+            }
+            SetTabColoringMode(mode) => {
+                let mode = *mode;
+                TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.tab_coloring_mode.set_value(mode, ctx));
+                });
+                ctx.notify();
+            }
+            SetTabStatusColor { target, color } => {
+                let (target, color) = (*target, *color);
+                TabSettings::handle(ctx).update(ctx, |settings, ctx| match target {
+                    StatusColorTarget::Working => {
+                        report_if_error!(settings.status_color_working.set_value(color, ctx));
+                    }
+                    StatusColorTarget::Blocked => {
+                        report_if_error!(settings.status_color_blocked.set_value(color, ctx));
+                    }
+                    StatusColorTarget::Idle => {
+                        report_if_error!(settings.status_color_idle.set_value(color, ctx));
+                    }
                 });
                 ctx.notify();
             }
@@ -1303,6 +1347,7 @@ impl AppearanceSettingsPageView {
                 ctx,
             ),
             tab_close_button_position_dropdown: Self::build_tab_close_button_position_dropdown(ctx),
+            tab_coloring_mode_dropdown: Self::build_tab_coloring_mode_dropdown(ctx),
             zoom_level_dropdown: Self::build_zoom_level_dropdown(ctx),
             zoom_reset_button_mouse_state: MouseStateHandle::default(),
             available_families: Default::default(),
@@ -1310,6 +1355,15 @@ impl AppearanceSettingsPageView {
             color_picker_dot_states: (0..directory_tab_colors(ctx).len())
                 .map(|_| {
                     (0..TAB_COLOR_OPTIONS.len() + 1)
+                        .map(|_| MouseStateHandle::default())
+                        .collect()
+                })
+                .collect(),
+            // Three status rows (working/blocked/idle), each with one dot per
+            // available ANSI color (no "no color" option for status).
+            status_color_dot_states: (0..3)
+                .map(|_| {
+                    (0..TAB_COLOR_OPTIONS.len())
                         .map(|_| MouseStateHandle::default())
                         .collect()
                 })
@@ -1488,6 +1542,11 @@ impl AppearanceSettingsPageView {
         }
 
         categories.push(Category::new("Tabs", tab_settings_widgets));
+
+        categories.push(Category::new(
+            "Tab Coloring",
+            vec![Box::new(TabColoringWidget::default())],
+        ));
 
         categories.push(Category::new(
             "Full-screen Apps",
@@ -2532,6 +2591,45 @@ impl AppearanceSettingsPageView {
 
             dropdown
         })
+    }
+
+    fn build_tab_coloring_mode_dropdown(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Dropdown<AppearancePageAction>> {
+        ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+
+            let values = [TabColoringMode::Directory, TabColoringMode::TerminalStatus];
+
+            let current_value = *TabSettings::as_ref(ctx).tab_coloring_mode.value();
+            let selected_index = values
+                .iter()
+                .position(|val| *val == current_value)
+                .unwrap_or(0);
+
+            dropdown.set_items(
+                values
+                    .into_iter()
+                    .map(|value| {
+                        DropdownItem::new(
+                            Self::tab_coloring_mode_dropdown_item_label(value),
+                            AppearancePageAction::SetTabColoringMode(value),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
+            dropdown.set_selected_by_index(selected_index, ctx);
+
+            dropdown
+        })
+    }
+
+    fn tab_coloring_mode_dropdown_item_label(value: TabColoringMode) -> &'static str {
+        match value {
+            TabColoringMode::Directory => "Directory coloring",
+            TabColoringMode::TerminalStatus => "Terminal status",
+        }
     }
 
     fn build_zoom_level_dropdown(
@@ -5137,6 +5235,143 @@ impl SettingsWidget for DirectoryTabColorsWidget {
                     .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
                     .finish(),
             );
+        }
+
+        Container::new(content.finish())
+            .with_padding_bottom(HEADER_PADDING)
+            .finish()
+    }
+}
+
+/// The "Tab Coloring" section: choose how tabs are colored (by directory or by
+/// terminal/CLI-agent status) and, in Terminal Status mode, pick the colors for
+/// the working / blocked / idle states.
+#[derive(Default)]
+struct TabColoringWidget {}
+
+impl SettingsWidget for TabColoringWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "tab coloring mode directory terminal status working blocked idle color agent"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let mut content = Flex::column().with_spacing(8.);
+
+        // Mode selector: Directory coloring vs Terminal status.
+        content.add_child(render_dropdown_item(
+            appearance,
+            "Coloring mode",
+            Some("Color tabs by their working directory, or by the status of the CLI agent running in them."),
+            None,
+            LocalOnlyIconState::for_setting(
+                TabColoringMode::storage_key(),
+                TabColoringMode::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            None,
+            &view.tab_coloring_mode_dropdown,
+        ));
+
+        // In Terminal Status mode, expose the working / blocked / idle color
+        // pickers so the user can customize each status color.
+        let mode = *TabSettings::as_ref(app).tab_coloring_mode.value();
+        if matches!(mode, TabColoringMode::TerminalStatus) {
+            let tab_settings = TabSettings::as_ref(app);
+            let rows: [(StatusColorTarget, &str, AnsiColorIdentifier); 3] = [
+                (
+                    StatusColorTarget::Working,
+                    "Working",
+                    *tab_settings.status_color_working.value(),
+                ),
+                (
+                    StatusColorTarget::Blocked,
+                    "Blocked",
+                    *tab_settings.status_color_blocked.value(),
+                ),
+                (
+                    StatusColorTarget::Idle,
+                    "Idle",
+                    *tab_settings.status_color_idle.value(),
+                ),
+            ];
+
+            for (row_idx, (target, label, current_color)) in rows.into_iter().enumerate() {
+                let Some(dot_states) = view.status_color_dot_states.get(row_idx).cloned() else {
+                    log::error!("Missing status color picker dot states for row {row_idx}");
+                    continue;
+                };
+
+                let label_element = Shrinkable::new(
+                    1.,
+                    Text::new(label, appearance.ui_font_family(), appearance.ui_font_size())
+                        .with_color(theme.nonactive_ui_text_color().into())
+                        .soft_wrap(false)
+                        .finish(),
+                )
+                .finish();
+
+                let mut dots_row =
+                    Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+                for (ansi_id, mouse_state) in TAB_COLOR_OPTIONS
+                    .iter()
+                    .copied()
+                    .zip(dot_states.iter().cloned())
+                {
+                    let dot_color: pathfinder_color::ColorU =
+                        ansi_id.to_ansi_color(&theme.terminal_colors().normal).into();
+                    let is_selected = current_color == ansi_id;
+                    let tooltip_text = ansi_id.to_string();
+                    dots_row.add_child(
+                        render_color_dot(
+                            mouse_state,
+                            dot_color,
+                            is_selected,
+                            theme.accent().into(),
+                            false,
+                            theme.foreground(),
+                            tooltip_text,
+                            appearance,
+                        )
+                        .on_click(move |ctx, _, _| {
+                            if !is_selected {
+                                ctx.dispatch_typed_action(
+                                    AppearancePageAction::SetTabStatusColor {
+                                        target,
+                                        color: ansi_id,
+                                    },
+                                );
+                            }
+                        })
+                        .finish(),
+                    );
+                }
+
+                let row = Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                    .with_child(label_element)
+                    .with_child(dots_row.finish())
+                    .finish();
+
+                content.add_child(
+                    Container::new(row)
+                        .with_horizontal_padding(16.)
+                        .with_vertical_padding(8.)
+                        .with_background(theme.surface_1())
+                        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+                        .finish(),
+                );
+            }
         }
 
         Container::new(content.finish())

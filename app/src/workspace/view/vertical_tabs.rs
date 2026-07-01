@@ -56,7 +56,7 @@ use crate::pane_group::{
 };
 use crate::safe_triangle::SafeTriangle;
 use crate::tab::{tab_position_id, SelectedTabColor, TabData};
-use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+use crate::terminal::cli_agent_sessions::{CLIAgentSessionStatus, CLIAgentSessionsModel};
 use crate::terminal::session_settings::SessionSettings;
 use crate::terminal::view::TerminalViewState;
 use crate::terminal::{CLIAgent, TerminalView};
@@ -72,7 +72,7 @@ use crate::workspace::cross_window_tab_drag::CrossWindowTabDrag;
 use crate::workspace::hoa_onboarding::HoaOnboardingStep;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::{
-    TabSettings, VerticalTabsCompactSubtitle, VerticalTabsDisplayGranularity,
+    TabColoringMode, TabSettings, VerticalTabsCompactSubtitle, VerticalTabsDisplayGranularity,
     VerticalTabsPrimaryInfo, VerticalTabsTabItemMode, VerticalTabsViewMode,
 };
 use crate::workspace::view::vertical_tabs::telemetry::{
@@ -115,6 +115,14 @@ const TAB_COLOR_OPACITY: Opacity = 15;
 const TAB_COLOR_HOVER_OPACITY: Opacity = 50;
 /// Opacity for a colored row that is part of a multi-selection.
 const TAB_COLOR_MULTI_SELECT_OPACITY: Opacity = 30;
+
+// Terminal-status tab coloring is meant as an at-a-glance signal, so it uses
+// bolder opacities than the (intentionally subtle) directory coloring — in
+// particular the resting/inactive value is much higher so background tabs stay
+// legible, especially light colors like yellow.
+const STATUS_TAB_COLOR_OPACITY: Opacity = 48;
+const STATUS_TAB_COLOR_HOVER_OPACITY: Opacity = 70;
+const STATUS_TAB_COLOR_MULTI_SELECT_OPACITY: Opacity = 58;
 
 // Circular icon constants
 const ICON_WITH_STATUS_GAP: f32 = 8.;
@@ -344,15 +352,29 @@ fn pane_row_background(
     is_in_multi_selection: bool,
     is_hovered: bool,
     is_being_dragged: bool,
+    is_status_coloring: bool,
     theme: &WarpTheme,
 ) -> Option<ThemeFill> {
     if let Some(color) = pane_color {
-        let opacity = if is_selected || is_hovered {
-            TAB_COLOR_HOVER_OPACITY
-        } else if is_in_multi_selection {
-            TAB_COLOR_MULTI_SELECT_OPACITY
+        let (resting, hover, multi) = if is_status_coloring {
+            (
+                STATUS_TAB_COLOR_OPACITY,
+                STATUS_TAB_COLOR_HOVER_OPACITY,
+                STATUS_TAB_COLOR_MULTI_SELECT_OPACITY,
+            )
         } else {
-            TAB_COLOR_OPACITY
+            (
+                TAB_COLOR_OPACITY,
+                TAB_COLOR_HOVER_OPACITY,
+                TAB_COLOR_MULTI_SELECT_OPACITY,
+            )
+        };
+        let opacity = if is_selected || is_hovered {
+            hover
+        } else if is_in_multi_selection {
+            multi
+        } else {
+            resting
         };
         Some(color.with_opacity(opacity))
     } else if is_selected {
@@ -400,6 +422,7 @@ fn render_pane_row_element(
         is_in_multi_selection,
         is_in_multi_tab_selection,
         pane_color,
+        is_status_coloring,
         badge_mouse_states: _,
         detail_hover_state,
         display_granularity,
@@ -432,6 +455,7 @@ fn render_pane_row_element(
             is_in_multi_selection,
             state.is_hovered(),
             is_being_dragged,
+            is_status_coloring,
             theme,
         ) {
             container = container.with_background(background);
@@ -842,6 +866,9 @@ struct PaneProps<'a> {
     /// otherwise the single-pane menu.
     is_in_multi_tab_selection: bool,
     pane_color: Option<ThemeFill>,
+    /// True when tab coloring is in Terminal Status mode, so the row background
+    /// uses the bolder status opacities instead of the subtle directory ones.
+    is_status_coloring: bool,
     badge_mouse_states: PaneRowBadgeMouseStates,
     detail_hover_state: VerticalTabsDetailHoverState,
     display_granularity: VerticalTabsDisplayGranularity,
@@ -2144,8 +2171,15 @@ fn render_tab_group_internal(
         if in_tab_group && matches!(display_granularity, VerticalTabsDisplayGranularity::Panes) {
             None
         } else {
+            // Manual rename wins; otherwise fall back to the CLI-agent session's
+            // own live title so Claude tabs show the session name instead of the
+            // frozen launch command. `None` for plain shells (keeps pane title).
             (!uses_outer_group_container)
-                .then(|| pane_group.custom_title(app))
+                .then(|| {
+                    pane_group
+                        .custom_title(app)
+                        .or_else(|| pane_group.agent_session_title(app))
+                })
                 .flatten()
         };
     let is_menu_open_for_tab = workspace
@@ -3834,6 +3868,10 @@ impl<'a> PaneProps<'a> {
             is_in_multi_selection,
             is_in_multi_tab_selection,
             pane_color: pane_row_state.pane_color,
+            is_status_coloring: matches!(
+                *TabSettings::as_ref(app).tab_coloring_mode.value(),
+                TabColoringMode::TerminalStatus
+            ),
             badge_mouse_states: pane_row_state.badge_mouse_states,
             detail_hover_state,
             display_granularity,
@@ -4128,8 +4166,24 @@ fn terminal_agent_text(terminal_view: &TerminalView, app: &AppContext) -> Termin
         agent_text.conversation_display_title.is_some() || agent_text.is_oz_agent;
 
     if let Some(session) = cli_agent_session {
-        agent_text.cli_agent_title = session.session_context.title_like_text();
-        agent_text.cli_agent_latest_user_prompt = session.session_context.latest_user_prompt();
+        // The session's live name: an explicit transcript title (a `/rename`
+        // wins over the auto title there) or the terminal (OSC) title, which
+        // Claude Code maintains as the session name — including after
+        // `/rename`, which emits no plugin event. It outranks prompt-derived
+        // text in both tab-text preferences so agent tabs track the session's
+        // real name instead of freezing on the launch command or last prompt.
+        let session_title = session.session_context.ai_session_title().or_else(|| {
+            let title = terminal_view.terminal_title_from_shell();
+            let title = title.trim();
+            let is_cwd_placeholder = resolved_terminal_working_directory(terminal_view, app)
+                .is_some_and(|wd| wd.trim() == title);
+            (!title.is_empty() && !is_cwd_placeholder).then(|| title.to_owned())
+        });
+        agent_text.cli_agent_title = session_title
+            .clone()
+            .or_else(|| session.session_context.title_like_text());
+        agent_text.cli_agent_latest_user_prompt =
+            session_title.or_else(|| session.session_context.latest_user_prompt());
     }
 
     agent_text
@@ -5487,6 +5541,16 @@ fn compute_tab_group_color_mode(
     theme: &WarpTheme,
     app: &AppContext,
 ) -> TabGroupColorMode {
+    // Tab Coloring — Terminal Status mode: color panes by the status of the
+    // CLI-agent session running in them, mutually exclusive with directory and
+    // manual tab colors.
+    if matches!(
+        *TabSettings::as_ref(app).tab_coloring_mode.value(),
+        TabColoringMode::TerminalStatus
+    ) {
+        return compute_status_tab_color_mode(pane_group, visible_pane_ids, theme, app);
+    }
+
     // A manual color override applies to the whole tab.
     if !matches!(tab.selected_color, SelectedTabColor::Unset) {
         return match tab.selected_color.resolve(tab.default_directory_color) {
@@ -5545,6 +5609,74 @@ fn compute_tab_group_color_mode(
         }
     }
 
+    // Uniform only when every pane has a color and they all match.
+    let is_uniform = !has_uncolored && distinct_colors.len() == 1;
+
+    if distinct_colors.is_empty() {
+        TabGroupColorMode::None
+    } else if is_uniform {
+        let color = distinct_colors[0];
+        TabGroupColorMode::Uniform(color.to_ansi_color(&theme.terminal_colors().normal).into())
+    } else {
+        let theme_map = per_pane
+            .into_iter()
+            .map(|(id, c)| {
+                let fill = c.map(|c| c.to_ansi_color(&theme.terminal_colors().normal).into());
+                (id, fill)
+            })
+            .collect();
+        TabGroupColorMode::PerPane(theme_map)
+    }
+}
+
+/// Per-pane tab color mode driven by CLI-agent session status (Terminal Status
+/// tab coloring). Mirrors the collapse logic of [`compute_tab_group_color_mode`]
+/// but sources each pane's color from the status of the CLI-agent session in
+/// that pane, using the user-configured working / blocked / idle colors. Panes
+/// without a tracked, rich-status CLI-agent session are left uncolored.
+fn compute_status_tab_color_mode(
+    pane_group: &PaneGroup,
+    visible_pane_ids: &[PaneId],
+    theme: &WarpTheme,
+    app: &AppContext,
+) -> TabGroupColorMode {
+    let tab_settings = TabSettings::as_ref(app);
+    let per_pane: HashMap<PaneId, Option<AnsiColorIdentifier>> = visible_pane_ids
+        .iter()
+        .map(|&pane_id| {
+            let color = pane_group
+                .terminal_view_from_pane_id(pane_id, app)
+                .and_then(|tv| {
+                    let terminal_view = tv.as_ref(app);
+                    // Same guards as the horizontal tab bar: only trust sessions
+                    // that received a rich OSC 777 notification, skip Unknown
+                    // agents (see `summary_conversation_status_for_terminal`).
+                    let session = CLIAgentSessionsModel::as_ref(app)
+                        .session(terminal_view.id())
+                        .filter(|s| s.supports_rich_status())
+                        .filter(|s| !matches!(s.agent, CLIAgent::Unknown))?;
+                    let id = match &session.status {
+                        CLIAgentSessionStatus::InProgress => {
+                            *tab_settings.status_color_working.value()
+                        }
+                        CLIAgentSessionStatus::Blocked { .. } => {
+                            *tab_settings.status_color_blocked.value()
+                        }
+                        CLIAgentSessionStatus::Success => *tab_settings.status_color_idle.value(),
+                    };
+                    Some(id)
+                });
+            (pane_id, color)
+        })
+        .collect();
+
+    let has_uncolored = per_pane.values().any(|c| c.is_none());
+    let mut distinct_colors: Vec<AnsiColorIdentifier> = Vec::new();
+    for color in per_pane.values().flatten() {
+        if !distinct_colors.contains(color) {
+            distinct_colors.push(*color);
+        }
+    }
     // Uniform only when every pane has a color and they all match.
     let is_uniform = !has_uncolored && distinct_colors.len() == 1;
 
