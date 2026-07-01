@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::time::Duration;
 
 use warp::tui_export::{
     AIAgentAction, AIAgentActionId, AIAgentActionType, AIAgentExchangeId, AIAgentInput,
@@ -168,9 +169,10 @@ fn agent_block_renders_tool_calls_in_message_order() {
             let mut presenter = TuiPresenter::new();
             let frame = presenter.present_element(
                 block.render_element(app_ctx),
-                TuiRect::new(0, 0, 40, 4),
+                TuiRect::new(0, 0, 40, 6),
                 app_ctx,
             );
+            // Each block carries its own bottom padding, so a blank row follows every block.
             assert_eq!(
                 frame
                     .buffer
@@ -178,13 +180,13 @@ fn agent_block_renders_tool_calls_in_message_order() {
                     .into_iter()
                     .map(|line| line.trim_end().to_owned())
                     .collect::<Vec<_>>(),
-                vec!["before", "executed a tool call", "after", ""],
+                vec!["before", "", "executed a tool call", "", "after", ""],
             );
             assert_eq!(
-                frame.buffer[(0, 1)].fg,
+                frame.buffer[(0, 2)].fg,
                 expected_tool_call_text_color(app_ctx)
             );
-            assert!(frame.buffer[(0, 1)].modifier.contains(Modifier::DIM));
+            assert!(frame.buffer[(0, 2)].modifier.contains(Modifier::DIM));
         });
     });
 }
@@ -309,6 +311,166 @@ fn agent_block_omits_unsupported_sections_until_the_tui_can_render_them() {
     });
 }
 
+#[test]
+fn streaming_reasoning_renders_thinking_header_with_body() {
+    App::test((), |app| async move {
+        app.add_singleton_model(|_| Appearance::mock());
+        app.read(|app_ctx| {
+            let block = test_agent_block(FakeAgentBlockModel {
+                inputs: Vec::new(),
+                status: reasoning_status(None, "line one\nline two"),
+            });
+
+            assert_eq!(
+                block.sections(app_ctx),
+                vec![TuiAIBlockSection::Thinking {
+                    message_id: MessageId::new("reasoning-1".to_owned()),
+                    finished_duration: None,
+                    body: "line one\nline two".to_owned(),
+                }]
+            );
+
+            let rendered = render_block_lines(&block, 40, app_ctx);
+            assert_eq!(rendered[0], "Thinking... ▾");
+            // Body lines are indented four spaces beneath the header.
+            assert_eq!(rendered[1], "    line one");
+            assert_eq!(rendered[2], "    line two");
+        });
+    });
+}
+
+#[test]
+fn finished_reasoning_renders_collapsed_thought_for_header() {
+    App::test((), |app| async move {
+        app.add_singleton_model(|_| Appearance::mock());
+        app.read(|app_ctx| {
+            let block = test_agent_block(FakeAgentBlockModel {
+                inputs: Vec::new(),
+                status: reasoning_status(Some(Duration::from_secs(15)), "hidden body"),
+            });
+
+            let rendered = render_block_lines(&block, 40, app_ctx);
+            assert_eq!(rendered[0], "Thought for 15 seconds ▸");
+            // Collapsed: the reasoning body is not rendered.
+            assert!(rendered.iter().all(|line| !line.contains("hidden body")));
+        });
+    });
+}
+
+#[test]
+fn finished_reasoning_uses_singular_second() {
+    App::test((), |app| async move {
+        app.add_singleton_model(|_| Appearance::mock());
+        app.read(|app_ctx| {
+            let block = test_agent_block(FakeAgentBlockModel {
+                inputs: Vec::new(),
+                status: reasoning_status(Some(Duration::from_secs(1)), "body"),
+            });
+            let rendered = render_block_lines(&block, 40, app_ctx);
+            assert_eq!(rendered[0], "Thought for 1 second ▸");
+        });
+    });
+}
+
+#[test]
+fn finished_reasoning_auto_collapses_on_first_extraction() {
+    App::test((), |app| async move {
+        app.add_singleton_model(|_| Appearance::mock());
+        app.read(|app_ctx| {
+            let block = test_agent_block(FakeAgentBlockModel {
+                inputs: Vec::new(),
+                status: reasoning_status(Some(Duration::from_secs(2)), "body"),
+            });
+            block.sections(app_ctx);
+            assert!(block.is_thinking_collapsed(&MessageId::new("reasoning-1".to_owned())));
+        });
+    });
+}
+
+#[test]
+fn streaming_reasoning_stays_expanded() {
+    App::test((), |app| async move {
+        app.add_singleton_model(|_| Appearance::mock());
+        app.read(|app_ctx| {
+            let block = test_agent_block(FakeAgentBlockModel {
+                inputs: Vec::new(),
+                status: reasoning_status(None, "body"),
+            });
+            block.sections(app_ctx);
+            assert!(!block.is_thinking_collapsed(&MessageId::new("reasoning-1".to_owned())));
+        });
+    });
+}
+
+#[test]
+fn manual_toggle_before_finish_suppresses_auto_collapse() {
+    let block = test_agent_block(FakeAgentBlockModel {
+        inputs: Vec::new(),
+        status: reasoning_status(None, "body"),
+    });
+    let message_id = MessageId::new("reasoning-1".to_owned());
+
+    // Streaming seen, then the user toggles (keeping it expanded).
+    block.sync_thinking_state(&message_id, false);
+    block
+        .thinking_states
+        .borrow_mut()
+        .get_mut(&message_id)
+        .expect("state exists after first sync")
+        .user_toggled = true;
+
+    // On finish, a user-toggled block does not auto-collapse.
+    block.sync_thinking_state(&message_id, true);
+    assert!(!block.is_thinking_collapsed(&message_id));
+}
+
+#[test]
+fn reasoning_interleaves_with_plain_text_in_message_order() {
+    App::test((), |app| async move {
+        app.read(|app_ctx| {
+            let block = test_agent_block(FakeAgentBlockModel {
+                inputs: Vec::new(),
+                status: complete_output_messages(vec![
+                    plain_text_message("m1", "before"),
+                    reasoning_message("r1", None, "thinking"),
+                    plain_text_message("m2", "after"),
+                ]),
+            });
+            assert_eq!(
+                block.sections(app_ctx),
+                vec![
+                    TuiAIBlockSection::PlainText("before".to_owned()),
+                    TuiAIBlockSection::Thinking {
+                        message_id: MessageId::new("r1".to_owned()),
+                        finished_duration: None,
+                        body: "thinking".to_owned(),
+                    },
+                    TuiAIBlockSection::PlainText("after".to_owned()),
+                ]
+            );
+        });
+    });
+}
+
+#[test]
+fn multiple_reasoning_blocks_have_independent_collapse_state() {
+    App::test((), |app| async move {
+        app.read(|app_ctx| {
+            let block = test_agent_block(FakeAgentBlockModel {
+                inputs: Vec::new(),
+                status: complete_output_messages(vec![
+                    reasoning_message("r1", Some(Duration::from_secs(3)), "done"),
+                    reasoning_message("r2", None, "still going"),
+                ]),
+            });
+            block.sections(app_ctx);
+            // The finished block collapses; the streaming one stays expanded.
+            assert!(block.is_thinking_collapsed(&MessageId::new("r1".to_owned())));
+            assert!(!block.is_thinking_collapsed(&MessageId::new("r2".to_owned())));
+        });
+    });
+}
+
 struct FakeAgentBlockModel {
     inputs: Vec<AIAgentInput>,
     status: AIBlockOutputStatus,
@@ -419,6 +581,65 @@ fn test_action(id: &str) -> AIAgentAction {
         action: AIAgentActionType::InitProject,
         requires_result: true,
     }
+}
+
+/// Builds an output status with a single reasoning message (id `reasoning-1`)
+/// whose body is one plain-text section.
+fn reasoning_status(finished_duration: Option<Duration>, body: &str) -> AIBlockOutputStatus {
+    complete_output_messages(vec![reasoning_message(
+        "reasoning-1",
+        finished_duration,
+        body,
+    )])
+}
+
+/// Builds a reasoning output message with a single plain-text body section.
+fn reasoning_message(
+    id: &str,
+    finished_duration: Option<Duration>,
+    body: &str,
+) -> AIAgentOutputMessage {
+    AIAgentOutputMessage {
+        id: MessageId::new(id.to_owned()),
+        message: AIAgentOutputMessageType::Reasoning {
+            text: AIAgentText {
+                sections: vec![AIAgentTextSection::PlainText {
+                    text: body.to_owned().into(),
+                }],
+            },
+            finished_duration,
+        },
+        citations: Vec::new(),
+    }
+}
+
+/// Builds a text output message from a single plain-text string.
+fn plain_text_message(id: &str, text: &str) -> AIAgentOutputMessage {
+    text_message(
+        id,
+        vec![AIAgentTextSection::PlainText {
+            text: text.to_owned().into(),
+        }],
+    )
+}
+
+/// Renders the block at `width` and returns its non-empty rows, trimmed of
+/// trailing padding, so header/body assertions ignore blank rows.
+fn render_block_lines(block: &TuiAIBlock, width: u16, app: &AppContext) -> Vec<String> {
+    let height = block.desired_height(width, app).max(1) as u16;
+    let mut presenter = TuiPresenter::new();
+    let frame = presenter.present_element(
+        block.render_element(app),
+        TuiRect::new(0, 0, width, height),
+        app,
+    );
+    frame
+        .buffer
+        .to_lines()
+        .into_iter()
+        .map(|line| line.trim_end().to_owned())
+        .filter(|line| !line.is_empty())
+        .collect()
 }
 
 /// Builds one user-query input for model-backed extraction tests.
