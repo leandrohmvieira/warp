@@ -446,6 +446,47 @@ settings::macros::implement_setting_for_enum!(
     description: "Subtitle shown on compact vertical tabs.",
 );
 
+/// How tabs are colored.
+///
+/// The two modes are mutually exclusive: `Directory` uses Warp's per-directory
+/// tab colors (see [`DirectoryTabColors`]); `TerminalStatus` colors the whole
+/// tab by the status of the CLI-agent session running in its focused pane,
+/// using the configured `status_color_*` colors.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    Copy,
+    Clone,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "How tabs are colored: by working directory or by terminal (CLI-agent) status.",
+    rename_all = "snake_case"
+)]
+pub enum TabColoringMode {
+    /// Color tabs based on their working directory (see `directory_tab_colors`).
+    #[default]
+    Directory,
+    /// Color the whole tab by the CLI-agent session status in its focused pane
+    /// (working / blocked / idle), using the configured status colors.
+    TerminalStatus,
+}
+
+settings::macros::implement_setting_for_enum!(
+    TabColoringMode,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+    private: false,
+    toml_path: "appearance.tabs.tab_coloring_mode",
+    description: "How tabs are colored: by working directory or by terminal (CLI-agent) status.",
+);
+
 define_settings_group!(TabSettings, settings: [
     show_indicators: ShowIndicatorsButton {
         type: bool,
@@ -556,6 +597,34 @@ define_settings_group!(TabSettings, settings: [
     workspace_decoration_visibility: WorkspaceDecorationVisibility,
     close_button_position: TabCloseButtonPosition,
     directory_tab_colors: DirectoryTabColors,
+    tab_coloring_mode: TabColoringMode,
+    status_color_working: StatusColorWorking {
+        type: AnsiColorIdentifier,
+        default: AnsiColorIdentifier::Yellow,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "appearance.tabs.status_color_working",
+        description: "Tab color for a working / in-progress CLI-agent session.",
+    },
+    status_color_blocked: StatusColorBlocked {
+        type: AnsiColorIdentifier,
+        default: AnsiColorIdentifier::Red,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "appearance.tabs.status_color_blocked",
+        description: "Tab color for a blocked CLI-agent session that needs your input.",
+    },
+    status_color_idle: StatusColorIdle {
+        type: AnsiColorIdentifier,
+        default: AnsiColorIdentifier::Green,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "appearance.tabs.status_color_idle",
+        description: "Tab color for an idle CLI-agent session (your turn).",
+    },
 ]);
 
 #[cfg(test)]

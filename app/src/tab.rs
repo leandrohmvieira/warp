@@ -35,6 +35,8 @@ use crate::launch_configs::launch_config::LaunchConfig;
 use crate::menu::{MenuAction, MenuItem, MenuItemFields};
 use crate::pane_group::{PaneGroup, PaneId};
 use crate::shell_indicator::ShellIndicatorType;
+use crate::terminal::cli_agent_sessions::{CLIAgentSessionStatus, CLIAgentSessionsModel};
+use crate::terminal::CLIAgent;
 use crate::terminal::shared_session::render_util::shared_session_indicator_color;
 use crate::terminal::view::TerminalViewState;
 use crate::themes::theme::{AnsiColorIdentifier, Fill as ThemeFill, VerticalGradient};
@@ -47,7 +49,7 @@ use crate::window_settings::WindowSettings;
 use crate::workspace::sync_inputs::SyncedInputState;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::{
-    TabCloseButtonPosition, TabSettings, VerticalTabsDisplayGranularity,
+    TabCloseButtonPosition, TabColoringMode, TabSettings, VerticalTabsDisplayGranularity,
 };
 use crate::workspace::{
     PaneViewLocator, TabBarDropTargetData, TabBarLocation, TabContextMenuAnchor, WorkspaceAction,
@@ -873,6 +875,12 @@ pub struct TabComponent<'a> {
     /// both the in-selection highlight and the right-click menu dispatch
     /// (multi-tab menu vs single-tab menu).
     is_in_multi_tab_selection: bool,
+    /// Resolved whole-tab status color for this tab, if Tab Coloring is set to
+    /// Terminal Status and the focused pane has a tracked CLI-agent session.
+    /// Encodes the user-configured working/blocked/idle color; `None` in
+    /// Directory mode or for tabs with no tracked CLI-agent session (regular
+    /// shells keep their normal styling).
+    status_tab_color: Option<ColorU>,
 }
 
 /// Structure that holds TabComponent styles.
@@ -1021,6 +1029,45 @@ impl<'a> TabComponent<'a> {
             pane_group_id,
             pane_id,
         };
+        // Tab Coloring: in Terminal Status mode, color the whole tab by the
+        // CLI-agent session status in its focused pane using the user's
+        // configured colors. Mirror the guards Warp uses elsewhere (see
+        // `summary_conversation_status_for_terminal` in vertical_tabs.rs): only
+        // trust sessions that received a rich OSC 777 notification, and skip
+        // Unknown/custom agents, so synthetic/unreliable statuses don't color.
+        let coloring_mode = *TabSettings::as_ref(ctx).tab_coloring_mode.value();
+        let status_tab_color = if matches!(coloring_mode, TabColoringMode::TerminalStatus) {
+            tab.pane_group
+                .as_ref(ctx)
+                .focused_session_view(ctx)
+                .and_then(|view| {
+                    let session = CLIAgentSessionsModel::as_ref(ctx)
+                        .session(view.id())
+                        .filter(|session| session.supports_rich_status())
+                        .filter(|session| !matches!(session.agent, CLIAgent::Unknown))?;
+                    let tab_settings = TabSettings::as_ref(ctx);
+                    let color_id = match &session.status {
+                        CLIAgentSessionStatus::InProgress => {
+                            *tab_settings.status_color_working.value()
+                        }
+                        CLIAgentSessionStatus::Blocked { .. } => {
+                            *tab_settings.status_color_blocked.value()
+                        }
+                        CLIAgentSessionStatus::Success => *tab_settings.status_color_idle.value(),
+                    };
+                    Some(color_id.to_ansi_color(&appearance.theme().terminal_colors().normal).into())
+                })
+        } else {
+            None
+        };
+        // In Terminal Status mode, suppress the directory-derived tab color so
+        // the two coloring modes stay mutually exclusive and the status color
+        // isn't tinted by a directory color underneath.
+        let styles_tab_color = if matches!(coloring_mode, TabColoringMode::TerminalStatus) {
+            None
+        } else {
+            tab.color()
+        };
         Self {
             tab: tab.clone(),
             tab_bar,
@@ -1028,7 +1075,7 @@ impl<'a> TabComponent<'a> {
             title,
             has_custom_title: tab.pane_group.as_ref(ctx).custom_title(ctx).is_some(),
             tab_index,
-            styles: TabStyles::default(appearance, tab.color()),
+            styles: TabStyles::default(appearance, styles_tab_color),
             ui_builder: appearance.ui_builder().clone(),
             indicator,
             close_button_position,
@@ -1043,6 +1090,7 @@ impl<'a> TabComponent<'a> {
             sole_grouped_member: false,
             locator,
             is_in_multi_tab_selection: false,
+            status_tab_color,
         }
     }
 
@@ -1624,6 +1672,22 @@ impl<'a> TabComponent<'a> {
             };
 
             (bg, border)
+        };
+
+        // Tab Coloring — Terminal Status mode: color the entire tab by the
+        // resolved CLI-agent status color (computed in the constructor from the
+        // user-configured working/blocked/idle colors). Overrides the default/
+        // directory background; in Directory mode `status_tab_color` is `None`
+        // and the tab keeps its normal styling.
+        let background_color = match self.status_tab_color {
+            Some(color) => {
+                // Keep status colors vibrant even on inactive tabs — the whole
+                // point is an at-a-glance signal for background tabs. Inactive
+                // stays near-opaque so muddy colors (esp. yellow) still read.
+                let opacity: Opacity = if is_active { 100 } else { 92 };
+                Fill::Solid(coloru_with_opacity(color, opacity))
+            }
+            None => background_color,
         };
 
         let full_tab_content = {
