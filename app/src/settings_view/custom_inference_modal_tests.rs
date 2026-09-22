@@ -1,11 +1,9 @@
-use std::collections::HashSet;
-
-use ai::api_keys::CustomEndpointModel;
+use ai::api_keys::{CustomEndpointModel, CustomEndpointSchema};
 use pathfinder_geometry::vector::vec2f;
 use warpui::platform::WindowStyle;
 use warpui::scene::Scene;
 use warpui::units::Pixels;
-use warpui::{App, Presenter, WindowInvalidation};
+use warpui::{App, EntityIdSet, Presenter, WindowInvalidation};
 
 use super::*;
 use crate::test_util::terminal::initialize_app_for_terminal_view;
@@ -15,6 +13,7 @@ fn endpoint_with_models(model_count: usize) -> CustomEndpoint {
         name: "Test endpoint".to_string(),
         url: "https://api.example.com/v1".to_string(),
         api_key: "key".to_string(),
+        schema: CustomEndpointSchema::default(),
         models: (0..model_count)
             .map(|index| CustomEndpointModel {
                 name: format!("model-{index}"),
@@ -61,7 +60,7 @@ fn modal_resizes_with_window_and_added_models() {
         let body = modal.read(&app, |modal, _| modal.body().clone());
         let mut presenter = Presenter::new(window_id);
         let invalidation = WindowInvalidation {
-            updated: HashSet::from([
+            updated: EntityIdSet::from_iter([
                 app.root_view_id(window_id).expect("root view should exist"),
                 body.id(),
             ]),
@@ -159,7 +158,7 @@ fn action_row_remains_fixed_when_form_scrolls() {
         });
         let body = modal.read(&app, |modal, _| modal.body().clone());
         let invalidation = WindowInvalidation {
-            updated: HashSet::from([
+            updated: EntityIdSet::from_iter([
                 app.root_view_id(window_id).expect("root view should exist"),
                 body.id(),
             ]),
@@ -299,6 +298,43 @@ fn prefill_resets_form_scroll_position() {
             modal.prefill(None, None, ctx);
 
             assert_eq!(modal.scroll_state.scroll_start(), Pixels::zero());
+        });
+    })
+}
+
+#[test]
+fn selecting_schema_is_reflected_in_saved_schema() {
+    App::test((), |mut app| async move {
+        init_modal_test_models(&mut app);
+        let (_window_id, modal) = app.add_window(WindowStyle::NotStealFocus, move |ctx| {
+            CustomEndpointModal::new(None, None, ctx)
+        });
+
+        modal.update(&mut app, |modal, ctx| {
+            // Before any selection, save() would persist the default schema.
+            assert_eq!(modal.selected_schema(ctx), CustomEndpointSchema::default());
+
+            // Simulate the user picking a different schema. Selecting by index
+            // mirrors the runtime click path (menu emits ItemSelected, which the
+            // dropdown mirrors into its selected item). AnthropicMessages is the
+            // third item.
+            modal.schema_dropdown.update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_index(2, ctx);
+            });
+
+            // The dropdown's mirrored selection carries the concrete action even
+            // though the popup is rendered externally.
+            assert_eq!(
+                modal.schema_dropdown.as_ref(ctx).selected_action(),
+                Some(CustomEndpointModalAction::SetSchema(
+                    CustomEndpointSchema::AnthropicMessages
+                )),
+            );
+            assert_eq!(
+                modal.selected_schema(ctx),
+                CustomEndpointSchema::AnthropicMessages,
+                "schema chosen in the dropdown should be what save() persists"
+            );
         });
     })
 }

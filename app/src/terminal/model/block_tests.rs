@@ -8,13 +8,12 @@ use futures_lite::stream::StreamExt;
 use warp_core::features::FeatureFlag;
 
 use super::*;
-use crate::ai::blocklist::agent_view::AgentViewState;
 use crate::terminal::model::ansi::{Attr, Handler};
 use crate::terminal::model::cell::Flags;
 use crate::terminal::model::header_grid::PromptEndPoint;
 use crate::terminal::model::session::SessionInfo;
 use crate::terminal::model::test_utils::{
-    create_test_block_with_grids, test_iterm_image, TestBlockBuilder,
+    TestBlockBuilder, create_test_block_with_grids, test_iterm_image,
 };
 use crate::test_util::mock_blockgrid;
 
@@ -48,7 +47,10 @@ pub fn test_find() {
 
     block.prompt_only_precmd(PromptMetadata::default());
     block.start();
-    assert_lines_approx_eq!(block.height(&AgentViewState::Inactive), 3.);
+    assert_lines_approx_eq!(
+        block.height(&crate::terminal::model::block::TranscriptScope::Terminal),
+        3.
+    );
 
     assert_approx_eq!(
         BlockSection,
@@ -86,7 +88,10 @@ pub fn test_find() {
     block.header_grid.command_grid_linefeed();
     block.header_grid.command_grid_linefeed();
 
-    assert_lines_approx_eq!(block.height(&AgentViewState::Inactive), 6.);
+    assert_lines_approx_eq!(
+        block.height(&crate::terminal::model::block::TranscriptScope::Terminal),
+        6.
+    );
 
     assert_approx_eq!(
         BlockSection,
@@ -151,7 +156,10 @@ pub fn test_find() {
 
     assert_eq!(block.header_grid.prompt_and_command_number_of_rows(), 3);
     assert_eq!(block.output_grid.len(), 3);
-    assert_lines_approx_eq!(block.height(&AgentViewState::Inactive), 8.5);
+    assert_lines_approx_eq!(
+        block.height(&crate::terminal::model::block::TranscriptScope::Terminal),
+        8.5
+    );
 
     assert_approx_eq!(
         BlockSection,
@@ -252,7 +260,10 @@ pub fn test_find() {
 
     assert_eq!(block.header_grid.prompt_and_command_number_of_rows(), 2);
     assert_eq!(block.output_grid.len(), 3);
-    assert_lines_approx_eq!(block.height(&AgentViewState::Inactive), 7.5);
+    assert_lines_approx_eq!(
+        block.height(&crate::terminal::model::block::TranscriptScope::Terminal),
+        7.5
+    );
 
     assert_approx_eq!(
         BlockSection,
@@ -404,10 +415,12 @@ pub fn test_command_grid_bold() {
     block.prompt_only_precmd(PromptMetadata::default());
 
     // We should have the BOLD flag enabled for commands, once we've started the command grid.
-    assert!(block
-        .header_grid
-        .command_cursor_flags()
-        .contains(Flags::BOLD));
+    assert!(
+        block
+            .header_grid
+            .command_cursor_flags()
+            .contains(Flags::BOLD)
+    );
 
     for c in "command".chars() {
         block.input(c);
@@ -426,20 +439,24 @@ pub fn test_command_grid_bold_after_reset() {
     block.prompt_only_precmd(PromptMetadata::default());
 
     // We should have the BOLD flag enabled for commands, once we've started the command grid.
-    assert!(block
-        .header_grid
-        .command_cursor_flags()
-        .contains(Flags::BOLD));
+    assert!(
+        block
+            .header_grid
+            .command_cursor_flags()
+            .contains(Flags::BOLD)
+    );
 
     for c in "command".chars() {
         block.input(c);
     }
     // Even after a Reset, we should still re-enable the BOLD flag.
     block.terminal_attribute(Attr::Reset);
-    assert!(block
-        .header_grid
-        .command_cursor_flags()
-        .contains(Flags::BOLD));
+    assert!(
+        block
+            .header_grid
+            .command_cursor_flags()
+            .contains(Flags::BOLD)
+    );
 
     block.finish(0);
 
@@ -508,12 +525,15 @@ pub fn test_block_height_non_bootstrapped_block() {
     block.on_finish_byte_processing(&ansi::ProcessorInput::new(&[]));
 
     // The block is empty since it was never started.
-    assert!(block.is_empty(&AgentViewState::Inactive));
+    assert!(block.is_empty(&crate::terminal::model::block::TranscriptScope::Terminal));
 
     block.start();
 
     // The block should be non-empty even though it wasn't bootstrapped.
-    assert_lines_approx_eq!(block.height(&AgentViewState::Inactive), 5.);
+    assert_lines_approx_eq!(
+        block.height(&crate::terminal::model::block::TranscriptScope::Terminal),
+        5.
+    );
 }
 
 #[test]
@@ -540,7 +560,10 @@ fn test_background_block() {
     // Background blocks have the usual top and bottom padding, but no
     // between-grid padding because there's only one grid.
     assert_lines_approx_eq!(block.output_grid_displayed_height(), 3);
-    assert_lines_approx_eq!(block.height(&AgentViewState::Inactive), 4.2);
+    assert_lines_approx_eq!(
+        block.height(&crate::terminal::model::block::TranscriptScope::Terminal),
+        4.2
+    );
 }
 
 #[test]
@@ -895,6 +918,59 @@ fn test_selection_bounds_all_grids_single_line_lprompt_command() {
         BlockGridPoint::Output(Point::new(2, 0)),
     );
     assert_eq!(all_grids, "lprompt%cmd1\nrprompt\noutput1\noutput2");
+}
+
+#[test]
+fn test_command_and_output_to_string_includes_ps1_prompt_command_rprompt_and_output() {
+    let block_index = BlockIndex::zero();
+    let mut prompt_and_command_grid = mock_blockgrid("lprompt%cmd1");
+    prompt_and_command_grid.finish();
+    let mut rprompt_grid = mock_blockgrid("rprompt");
+    rprompt_grid.finish();
+    let mut output_grid = mock_blockgrid("output1\r\noutput2\r\n");
+    output_grid.finish();
+
+    let mut block = create_test_block_with_grids(
+        block_index,
+        prompt_and_command_grid,
+        rprompt_grid,
+        output_grid,
+        true, /* honor_ps1 */
+    );
+    block.set_raw_prompt_end_point(Some(PromptEndPoint::PromptEnd {
+        point: Point::new(0, 7),
+        has_extra_trailing_newline: false,
+    }));
+
+    assert_eq!(
+        block.command_and_output_to_string(),
+        "lprompt%cmd1\nrprompt\noutput1\noutput2"
+    );
+}
+
+#[test]
+fn test_command_and_output_to_string_excludes_warp_prompt() {
+    let block_index = BlockIndex::zero();
+    let mut prompt_and_command_grid = mock_blockgrid("cmd1");
+    prompt_and_command_grid.finish();
+    let mut rprompt_grid = mock_blockgrid("rprompt");
+    rprompt_grid.finish();
+    let mut output_grid = mock_blockgrid("output1\r\noutput2\r\n");
+    output_grid.finish();
+
+    let mut block = create_test_block_with_grids(
+        block_index,
+        prompt_and_command_grid,
+        rprompt_grid,
+        output_grid,
+        false, /* honor_ps1 */
+    );
+    block.set_honor_ps1(false);
+
+    assert_eq!(
+        block.command_and_output_to_string(),
+        "cmd1\noutput1\noutput2"
+    );
 }
 
 /// Tests the single line lprompt, with trailing newline, and command case for text selection across grids.
