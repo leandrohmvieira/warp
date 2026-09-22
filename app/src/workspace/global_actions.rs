@@ -160,6 +160,19 @@ fn save_app(_: &(), ctx: &mut AppContext) {
 
     // Only compute the app state if we're definitely going to use it.
     let app_state = get_app_state(ctx);
+
+    // A snapshot with zero windows also shows up during app teardown: closing the
+    // last window destroys it (and `get_app_state` skips windows whose tabs are
+    // already gone) while `save_app` still fires from the focus / close callbacks,
+    // and `ApplicationStage::Terminating` is only set afterwards, so the
+    // `on_window_will_close` guard doesn't catch these. Persisting that empty
+    // snapshot wipes the session the same way a mid-drag save would, leaving
+    // nothing to restore on the next launch. Dropping it is safe: the last save
+    // taken while a window was still alive is the one we want on disk.
+    if app_state.windows.is_empty() {
+        return;
+    }
+
     let event = ModelEvent::Snapshot(app_state);
 
     if let Err(err) = model_event_sender.send(event) {
