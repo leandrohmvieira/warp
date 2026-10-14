@@ -45,7 +45,22 @@ static SOLE_INSTANCE_MUTEX: LazyLock<Mutex<Result<Option<MutexHandle>, Error>>> 
     LazyLock::new(|| Mutex::new(try_create_mutex()));
 
 pub(super) fn uri_named_pipe_name() -> String {
-    format!("Warp{:?}_URI_CHANNEL", ChannelState::channel())
+    format!(
+        "Warp{:?}{}_URI_CHANNEL",
+        ChannelState::channel(),
+        data_profile_suffix()
+    )
+}
+
+/// Scopes the single-instance lock and URI pipe to a `WARP_DATA_PROFILE`, so a
+/// development instance running under its own data profile is a separate
+/// instance instead of forwarding a new-window request to the regular one.
+/// Always empty in release builds (`data_profile` is debug-only), so the lock
+/// name the installer checks is unchanged.
+fn data_profile_suffix() -> String {
+    ChannelState::data_profile()
+        .map(|profile| format!("_{profile}"))
+        .unwrap_or_default()
 }
 
 fn try_create_mutex() -> Result<Option<MutexHandle>, Error> {
@@ -57,8 +72,12 @@ fn try_create_mutex() -> Result<Option<MutexHandle>, Error> {
     // NOTE: This lock name must stay in sync with `AppMutexName` in
     // `script/windows/windows-installer.iss`, which the installer uses to detect whether Warp is
     // running.
-    let name = format!("Local\\Warp{:?}_SingleInstance", ChannelState::channel())
-        .encode_utf16()
+    let name = format!(
+        "Local\\Warp{:?}{}_SingleInstance",
+        ChannelState::channel(),
+        data_profile_suffix()
+    )
+    .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<u16>>();
     let handle = unsafe { CreateMutexW(None, true, windows::core::PCWSTR(name.as_ptr())) };
