@@ -5938,6 +5938,13 @@ fn compute_status_tab_color_mode(
                         .filter(|s| s.supports_rich_status())
                         .filter(|s| !matches!(s.agent, CLIAgent::Unknown))?;
                     let id = match &session.status {
+                        // Idle at its prompt, but background work it started
+                        // will wake it again — neither working nor your turn.
+                        CLIAgentSessionStatus::InProgress
+                            if session.is_waiting_on_background_work() =>
+                        {
+                            *tab_settings.status_color_waiting.value()
+                        }
                         CLIAgentSessionStatus::InProgress => {
                             *tab_settings.status_color_working.value()
                         }

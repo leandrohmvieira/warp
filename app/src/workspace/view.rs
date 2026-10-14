@@ -3938,7 +3938,8 @@ impl Workspace {
             TabSettingsChangedEvent::TabColoringMode { .. }
             | TabSettingsChangedEvent::StatusColorWorking { .. }
             | TabSettingsChangedEvent::StatusColorBlocked { .. }
-            | TabSettingsChangedEvent::StatusColorIdle { .. } => {
+            | TabSettingsChangedEvent::StatusColorIdle { .. }
+            | TabSettingsChangedEvent::StatusColorWaiting { .. } => {
                 ctx.notify();
             }
         }

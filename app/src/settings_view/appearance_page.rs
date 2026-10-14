@@ -459,6 +459,7 @@ impl FontType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusColorTarget {
     Working,
+    Waiting,
     Blocked,
     Idle,
 }
@@ -531,7 +532,7 @@ pub enum AppearancePageAction {
     },
     /// Switch how tabs are colored (directory vs. terminal status).
     SetTabColoringMode(TabColoringMode),
-    /// Assign a color to one of the CLI-agent status slots (working/blocked/idle).
+    /// Assign a color to one of the CLI-agent status slots (working/waiting/blocked/idle).
     SetTabStatusColor {
         target: StatusColorTarget,
         color: AnsiColorIdentifier,
@@ -571,7 +572,7 @@ pub struct AppearanceSettingsPageView {
     alt_screen_padding_editor: ViewHandle<EditorView>,
     color_picker_dot_states: Vec<Vec<MouseStateHandle>>,
     /// Mouse states for the Tab Coloring status color-picker dots, one inner
-    /// vec per status row (working/blocked/idle), each with one entry per
+    /// vec per status row (working/waiting/blocked/idle), each with one entry per
     /// [`TAB_COLOR_OPTIONS`] color.
     status_color_dot_states: Vec<Vec<MouseStateHandle>>,
     directory_tab_color_delete_buttons: Vec<ViewHandle<ActionButton>>,
@@ -810,6 +811,9 @@ impl TypedActionView for AppearanceSettingsPageView {
                 TabSettings::handle(ctx).update(ctx, |settings, ctx| match target {
                     StatusColorTarget::Working => {
                         report_if_error!(settings.status_color_working.set_value(color, ctx));
+                    }
+                    StatusColorTarget::Waiting => {
+                        report_if_error!(settings.status_color_waiting.set_value(color, ctx));
                     }
                     StatusColorTarget::Blocked => {
                         report_if_error!(settings.status_color_blocked.set_value(color, ctx));
@@ -1390,9 +1394,9 @@ impl AppearanceSettingsPageView {
                         .collect()
                 })
                 .collect(),
-            // Three status rows (working/blocked/idle), each with one dot per
-            // available ANSI color (no "no color" option for status).
-            status_color_dot_states: (0..3)
+            // Four status rows (working/waiting/blocked/idle), each with one dot
+            // per available ANSI color (no "no color" option for status).
+            status_color_dot_states: (0..4)
                 .map(|_| {
                     (0..TAB_COLOR_OPTIONS.len())
                         .map(|_| MouseStateHandle::default())
@@ -5481,7 +5485,7 @@ impl SettingsWidget for DirectoryTabColorsWidget {
 
 /// The "Tab Coloring" section: choose how tabs are colored (by directory or by
 /// terminal/CLI-agent status) and, in Terminal Status mode, pick the colors for
-/// the working / blocked / idle states.
+/// the working / waiting / blocked / idle states.
 #[derive(Default)]
 struct TabColoringWidget {}
 
@@ -5489,7 +5493,7 @@ impl SettingsWidget for TabColoringWidget {
     type View = AppearanceSettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "tab coloring mode directory terminal status working blocked idle color agent"
+        "tab coloring mode directory terminal status working waiting background blocked idle color agent"
     }
 
     fn render(
@@ -5517,16 +5521,21 @@ impl SettingsWidget for TabColoringWidget {
             &view.tab_coloring_mode_dropdown,
         ));
 
-        // In Terminal Status mode, expose the working / blocked / idle color
+        // In Terminal Status mode, expose the working / waiting / blocked / idle color
         // pickers so the user can customize each status color.
         let mode = *TabSettings::as_ref(app).tab_coloring_mode.value();
         if matches!(mode, TabColoringMode::TerminalStatus) {
             let tab_settings = TabSettings::as_ref(app);
-            let rows: [(StatusColorTarget, &str, AnsiColorIdentifier); 3] = [
+            let rows: [(StatusColorTarget, &str, AnsiColorIdentifier); 4] = [
                 (
                     StatusColorTarget::Working,
                     "Working",
                     *tab_settings.status_color_working.value(),
+                ),
+                (
+                    StatusColorTarget::Waiting,
+                    "Waiting on background work",
+                    *tab_settings.status_color_waiting.value(),
                 ),
                 (
                     StatusColorTarget::Blocked,

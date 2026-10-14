@@ -85,6 +85,13 @@ pub struct CLIAgentSessionContext {
     /// `session_id` doesn't always name a transcript file (team sessions report
     /// a team-lead id), so the last known path is reused for title reads.
     pub transcript_path: Option<String>,
+    /// Set when the agent's last turn ended (`Stop`) while background work it
+    /// started is still pending — `run_in_background` commands, subagents,
+    /// monitors, scheduled wakeups. The agent is idle at its prompt but will
+    /// wake itself when that work finishes, so it's neither working nor done.
+    /// Cleared by the next status transition (a new prompt, a task
+    /// notification waking the agent, a stop with nothing pending, ...).
+    pub waiting_on_background_work: bool,
 }
 
 /// State of the rich input editor for composing a prompt to send to a CLI agent.
@@ -216,6 +223,16 @@ impl CLIAgentSession {
         self.received_rich_notification
     }
 
+    /// Whether the agent is idle at its prompt waiting on background work it
+    /// started (commands, subagents, monitors) rather than actively working.
+    /// The status stays `InProgress` in that window so task sync and
+    /// notifications don't treat the pause as completion; this distinguishes
+    /// it for surfaces (tab colors) that want to show it differently.
+    pub fn is_waiting_on_background_work(&self) -> bool {
+        matches!(self.status, CLIAgentSessionStatus::InProgress)
+            && self.session_context.waiting_on_background_work
+    }
+
     /// Whether the session is blocked on a `NeedsInput` notification, so nothing should be
     /// typed into its terminal.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
@@ -259,6 +276,7 @@ impl CLIAgentSession {
         // session's transcript path arrives with its first Stop event, and its
         // title must not bleed in from a previous session in this tab.
         if matches!(event.event, CLIAgentEventType::SessionStart) {
+            self.session_context.waiting_on_background_work = false;
             self.session_context.transcript_path = None;
             self.session_context.ai_title = None;
             self.session_context.query = None;
@@ -305,6 +323,7 @@ impl CLIAgentSession {
                 // The agent will wake itself again once that work finishes, so this turn
                 // boundary is a pause rather than the end of the session.
                 if event.payload.has_pending_background_work() {
+                    self.session_context.waiting_on_background_work = true;
                     return None;
                 }
                 CLIAgentSessionStatus::Success
@@ -361,6 +380,7 @@ impl CLIAgentSession {
         };
 
         self.status = new_status.clone();
+        self.session_context.waiting_on_background_work = false;
         Some(new_status)
     }
 }
@@ -690,6 +710,7 @@ impl CLIAgentSessionsModel {
         }
 
         let event_type = &event.event;
+        let was_waiting_on_background_work = session.session_context.waiting_on_background_work;
         // Interactive clients keep ignoring this event: only an unattended run has no one to
         // answer the prompt.
         let new_status = if matches!(event.event, CLIAgentEventType::NeedsInput)
@@ -710,12 +731,19 @@ impl CLIAgentSessionsModel {
             });
         }
 
-        if matches!(
-            event_type,
-            CLIAgentEventType::SessionStart
-                | CLIAgentEventType::PromptSubmit
-                | CLIAgentEventType::ToolComplete
-        ) {
+        // A stop with pending background work changes no status (so it emits no
+        // `StatusChanged`), but surfaces that render the waiting state still
+        // need to hear about it.
+        let waiting_flag_changed =
+            was_waiting_on_background_work != session.session_context.waiting_on_background_work;
+        if waiting_flag_changed
+            || matches!(
+                event_type,
+                CLIAgentEventType::SessionStart
+                    | CLIAgentEventType::PromptSubmit
+                    | CLIAgentEventType::ToolComplete
+            )
+        {
             ctx.emit(CLIAgentSessionsModelEvent::SessionUpdated {
                 terminal_view_id,
                 agent: session.agent,
@@ -843,6 +871,7 @@ impl CLIAgentSessionsModel {
         }
 
         session.status = CLIAgentSessionStatus::Cancelled;
+        session.session_context.waiting_on_background_work = false;
         let agent = session.agent;
         let session_context = Box::new(session.session_context.clone());
         ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {

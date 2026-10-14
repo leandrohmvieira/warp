@@ -1101,7 +1101,7 @@ pub struct TabComponent<'a> {
     is_in_multi_tab_selection: bool,
     /// Resolved whole-tab status color for this tab, if Tab Coloring is set to
     /// Terminal Status and the focused pane has a tracked CLI-agent session.
-    /// Encodes the user-configured working/blocked/idle color; `None` in
+    /// Encodes the user-configured working/waiting/blocked/idle color; `None` in
     /// Directory mode or for tabs with no tracked CLI-agent session (regular
     /// shells keep their normal styling).
     status_tab_color: Option<ColorU>,
@@ -1279,6 +1279,14 @@ impl<'a> TabComponent<'a> {
                         .filter(|session| !matches!(session.agent, CLIAgent::Unknown))?;
                     let tab_settings = TabSettings::as_ref(ctx);
                     let color_id = match &session.status {
+                        // The turn ended but background work the agent started
+                        // (commands, subagents, monitors) will wake it again:
+                        // it's waiting, not working and not your turn.
+                        CLIAgentSessionStatus::InProgress
+                            if session.is_waiting_on_background_work() =>
+                        {
+                            *tab_settings.status_color_waiting.value()
+                        }
                         CLIAgentSessionStatus::InProgress => {
                             *tab_settings.status_color_working.value()
                         }

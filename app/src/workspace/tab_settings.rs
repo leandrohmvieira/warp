@@ -650,6 +650,16 @@ define_settings_group!(TabSettings, settings: [
         toml_path: "appearance.tabs.status_color_idle",
         description: "Tab color for an idle CLI-agent session (your turn).",
     },
+    status_color_waiting: StatusColorWaiting {
+        type: AnsiColorIdentifier,
+        default: AnsiColorIdentifier::Blue,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.tabs.status_color_waiting",
+        description: "Tab color for a CLI-agent session idle while it waits on background work (commands, subagents, monitors).",
+    },
 ]);
 
 #[cfg(test)]
