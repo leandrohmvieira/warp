@@ -1287,6 +1287,11 @@ impl<'a> TabComponent<'a> {
                         {
                             *tab_settings.status_color_waiting.value()
                         }
+                        // Just started, sitting at its prompt before the first
+                        // turn: idle, not working.
+                        CLIAgentSessionStatus::InProgress if session.is_awaiting_first_prompt() => {
+                            *tab_settings.status_color_idle.value()
+                        }
                         CLIAgentSessionStatus::InProgress => {
                             *tab_settings.status_color_working.value()
                         }

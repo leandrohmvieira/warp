@@ -5945,6 +5945,10 @@ fn compute_status_tab_color_mode(
                         {
                             *tab_settings.status_color_waiting.value()
                         }
+                        // Just started, before its first turn: idle.
+                        CLIAgentSessionStatus::InProgress if session.is_awaiting_first_prompt() => {
+                            *tab_settings.status_color_idle.value()
+                        }
                         CLIAgentSessionStatus::InProgress => {
                             *tab_settings.status_color_working.value()
                         }

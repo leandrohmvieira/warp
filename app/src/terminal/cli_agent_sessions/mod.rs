@@ -92,6 +92,13 @@ pub struct CLIAgentSessionContext {
     /// Cleared by the next status transition (a new prompt, a task
     /// notification waking the agent, a stop with nothing pending, ...).
     pub waiting_on_background_work: bool,
+    /// Set by the `SessionStart` that registers the plugin listener (the
+    /// plugin only sends it on startup/resume), when the agent is sitting at
+    /// its prompt before any turn has run. The status stays at the optimistic
+    /// `InProgress` set at registration so notifications and task sync don't
+    /// see a fake completion; this lets tab colors show the session as idle.
+    /// Cleared by the first event that shows the agent doing something.
+    pub awaiting_first_prompt: bool,
 }
 
 /// State of the rich input editor for composing a prompt to send to a CLI agent.
@@ -233,6 +240,13 @@ impl CLIAgentSession {
             && self.session_context.waiting_on_background_work
     }
 
+    /// Whether the agent just started and is idle at its prompt, before its
+    /// first turn. See `CLIAgentSessionContext::awaiting_first_prompt`.
+    pub fn is_awaiting_first_prompt(&self) -> bool {
+        matches!(self.status, CLIAgentSessionStatus::InProgress)
+            && self.session_context.awaiting_first_prompt
+    }
+
     /// Whether the session is blocked on a `NeedsInput` notification, so nothing should be
     /// typed into its terminal.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
@@ -277,6 +291,7 @@ impl CLIAgentSession {
         // title must not bleed in from a previous session in this tab.
         if matches!(event.event, CLIAgentEventType::SessionStart) {
             self.session_context.waiting_on_background_work = false;
+            self.session_context.awaiting_first_prompt = true;
             self.session_context.transcript_path = None;
             self.session_context.ai_title = None;
             self.session_context.query = None;
@@ -300,6 +315,17 @@ impl CLIAgentSession {
         });
         if let Some(title) = transcript.as_deref().and_then(read_latest_session_title) {
             self.session_context.ai_title = Some(title);
+        }
+
+        // Anything but the start itself or an idle/unknown ping means a turn is
+        // running (or ran), even events below that leave the status unchanged.
+        if !matches!(
+            event.event,
+            CLIAgentEventType::SessionStart
+                | CLIAgentEventType::IdlePrompt
+                | CLIAgentEventType::Unknown(_)
+        ) {
+            self.session_context.awaiting_first_prompt = false;
         }
 
         let new_status = match &event.event {
@@ -711,6 +737,7 @@ impl CLIAgentSessionsModel {
 
         let event_type = &event.event;
         let was_waiting_on_background_work = session.session_context.waiting_on_background_work;
+        let was_awaiting_first_prompt = session.session_context.awaiting_first_prompt;
         // Interactive clients keep ignoring this event: only an unattended run has no one to
         // answer the prompt.
         let new_status = if matches!(event.event, CLIAgentEventType::NeedsInput)
@@ -731,11 +758,12 @@ impl CLIAgentSessionsModel {
             });
         }
 
-        // A stop with pending background work changes no status (so it emits no
-        // `StatusChanged`), but surfaces that render the waiting state still
-        // need to hear about it.
-        let waiting_flag_changed =
-            was_waiting_on_background_work != session.session_context.waiting_on_background_work;
+        // A stop with pending background work, or the first sign of activity
+        // after startup, can change no status (so it emits no `StatusChanged`),
+        // but surfaces that render those states still need to hear about it.
+        let waiting_flag_changed = was_waiting_on_background_work
+            != session.session_context.waiting_on_background_work
+            || was_awaiting_first_prompt != session.session_context.awaiting_first_prompt;
         if waiting_flag_changed
             || matches!(
                 event_type,
